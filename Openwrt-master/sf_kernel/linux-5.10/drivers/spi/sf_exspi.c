@@ -103,8 +103,9 @@ struct sf_exspi {
 	struct clk *clk, *apbclk;
 	struct device *dev;
 	struct mutex lock;
-	int freq;
-	int mode_bit;
+	int freq;		/* DT initial speed, applied by default_setup */
+	u32 cur_freq;		/* speed currently programmed */
+	u16 cur_cpsr, cur_scr;	/* divider pair matching cur_freq */
 	struct gpio_descs *cs_gpio;
 };
 
@@ -160,6 +161,20 @@ static int sf_exspi_wait_rx_not_empty(struct sf_exspi *s) {
 	} while (time_after(timeout, jiffies));
 
 	dev_err(s->dev, "read timed out\n");
+	return -ETIMEDOUT;
+}
+
+static int sf_exspi_wait_txfifo_not_full(struct sf_exspi *s) {
+	unsigned long timeout = jiffies + SF_READ_TIMEOUT;
+
+	do {
+		if (readw(s->base + SSP_SR) & SSP_SR_MASK_TNF)
+			return 0;
+
+		cond_resched();
+	} while (time_after(timeout, jiffies));
+
+	dev_err(s->dev, "write timed out\n");
 	return -ETIMEDOUT;
 }
 
@@ -226,6 +241,79 @@ static inline u32 spi_rate(u32 rate, u16 csdvsr, u16 scr) {
 	return rate / (csdvsr * (1 + scr));
 }
 
+static void sf_exspi_calc_div(struct sf_exspi *s, u32 speed, u16 *cpsr, u16 *scr) {
+	u32 rate = clk_get_rate(s->clk);
+	u32 min, max, best = 0, tmp;
+	u16 c, sc, best_cpsr = SSP_CPSR_MAX, best_scr = SSP_SCR_MAX;
+	bool found = false;
+
+	max = spi_rate(rate, SSP_CPSR_MIN, SSP_SCR_MIN);
+	min = spi_rate(rate, SSP_CPSR_MAX, SSP_SCR_MAX);
+
+	/* frequencies out of range get the closest reachable setting */
+	if (speed >= max) {
+		*cpsr = SSP_CPSR_MIN;
+		*scr = SSP_SCR_MIN;
+		return;
+	}
+	if (speed <= min) {
+		*cpsr = SSP_CPSR_MAX;
+		*scr = SSP_SCR_MAX;
+		return;
+	}
+
+	/*
+	 * Pick the highest reachable frequency NOT exceeding speed_hz:
+	 * the SPI core treats speed_hz as an upper bound, so rounding up
+	 * is not allowed. A candidate <= speed always exists in this range
+	 * because (CPSR_MAX, SCR_MAX) yields min, and min < speed here.
+	 */
+	for (c = SSP_CPSR_MIN; c <= SSP_CPSR_MAX && !found; c += 2) {
+		for (sc = SSP_SCR_MIN; sc <= SSP_SCR_MAX; sc++) {
+			tmp = spi_rate(rate, c, sc);
+			if (tmp > speed)
+				continue;
+			if (tmp > best) {
+				best = tmp;
+				best_cpsr = c;
+				best_scr = sc;
+				if (tmp == speed) {
+					found = true;
+					break;
+				}
+			}
+		}
+	}
+
+	*cpsr = best_cpsr;
+	*scr = best_scr;
+}
+
+/*
+ * Program the CPSR prescaler for speed_hz and return the matching (cpsr,
+ * scr) divider pair, so every caller assembles a complete CR0 in a single
+ * write: the pair returned is always the pair actually programmed, which
+ * rules out a CPSR(new) x SCR(old) mismatch.
+ *
+ * The SSP must be disabled when calling this function, since it writes
+ * CPSR. It never touches CR0 nor the SSE bit: configuring CR0 and the
+ * enable state stay the caller's job.
+ */
+static void sf_exspi_set_speed(struct sf_exspi *s, u32 speed_hz,
+			       u16 *cpsr, u16 *scr) {
+	if (speed_hz == s->cur_freq) {
+		*cpsr = s->cur_cpsr;
+		*scr = s->cur_scr;
+		return;
+	}
+
+	sf_exspi_calc_div(s, speed_hz, cpsr, scr);
+	writew(*cpsr, s->base + SSP_CPSR);
+	s->cur_freq = speed_hz;
+	s->cur_cpsr = *cpsr;
+	s->cur_scr = *scr;
+}
+
 static void sf_exspi_set_param(struct sf_exspi *s, const struct spi_mem_op *op) {
 	unsigned int tx_count = 0, rx_count = 0;
 	u8 cmd_io, addr_io, data_io;
@@ -277,8 +365,23 @@ static int sf_exspi_exec_op(struct spi_mem *mem,
 	int ret, i, op_len;
 	const u8 *tx_buf = NULL;
 	u8 *rx_buf = NULL, op_buf[MAX_S_BUF];
+	u16 cpsr, scr, cr0;
 
 	mutex_lock(&s->lock);
+	/* both paths fully reconfigure from the disabled state, so exec_op
+	 * and transfer_one may interleave freely */
+	sf_exspi_disable(s);
+	sf_exspi_set_speed(s, mem->spi->max_speed_hz, &cpsr, &scr);
+	/* rebuild the whole EXSPI frame CR0 from scratch: SPO/SPH must not
+	 * keep leftovers from a preceding Motorola transfer in mode 2/3,
+	 * and the mode always comes from the device being addressed */
+	cr0 = SSP_CR0_EXSPI_FRAME | SSP_CR0_BIT_MODE(8);
+	cr0 |= scr << SSP_SCR_SHFT;
+	if (mem->spi->mode & SPI_CPHA)
+		cr0 |= SSP_CR0_SPH;
+	if (mem->spi->mode & SPI_CPOL)
+		cr0 |= SSP_CR0_SPO;
+	writew(cr0, s->base + SSP_CR0);
 	/*TODO:???wait for the controller being ready*/
 	if (op->data.nbytes) {
 		if (op->data.dir == SPI_MEM_DATA_IN) {
@@ -342,51 +445,21 @@ static int sf_exspi_adjust_op_size(struct spi_mem *mem,
 	return 0;
 }
 
-static int sf_exspi_default_setup(struct sf_exspi *s) {
+static void sf_exspi_default_setup(struct sf_exspi *s) {
 	//int ret;
 	//clk_disable_unprepare(s->clk);
 	//ret = clk_set_rate(s->clk, 66000000);
-	u16 scr = SSP_SCR_MIN, cr0 = 0, cpsr = SSP_CPSR_MIN, best_scr = scr, best_cpsr = cpsr;
-	u32 min, max, best_freq = 0, tmp;
-	u32 rate = clk_get_rate(s->clk), speed = s->freq;
-	bool found = false;
+	u16 cpsr, scr, cr0;
 
-	writew(DFLT_PRESCALE, s->base + SSP_CPSR);
+	sf_exspi_disable(s);
+	sf_exspi_calc_div(s, s->freq, &cpsr, &scr);
 
-	max = spi_rate(rate, SSP_CPSR_MIN, SSP_SCR_MIN);
-	min = spi_rate(rate, SSP_CPSR_MAX, SSP_SCR_MAX);
-
-	if (speed > max || speed < min) {
-		dev_err(s->dev, "Tried to set speed to %dHz but min=%d and max=%d\n", speed, min, max);
-		return -EINVAL;
-	}
-	while (cpsr <= SSP_CPSR_MAX && !found) {
-		while (scr <= SSP_SCR_MAX) {
-			tmp = spi_rate(rate, cpsr, scr);
-			if (abs(speed - tmp) < abs(speed - best_freq)) {
-				best_freq = tmp;
-				best_cpsr = cpsr;
-				best_scr = scr;
-				if (tmp == speed) {
-					found = true;
-					break;
-				}
-			}
-			scr++;
-		}
-		cpsr += 2;
-		scr = SSP_SCR_MIN;
-	}
-	writew(best_cpsr, s->base + SSP_CPSR);
-	cr0 = SSP_CR0_BIT_MODE(8);
-	cr0 |= best_scr << 8;
-	/*set module*/
-	cr0 &= ~(SSP_CR0_SPH | SSP_CR0_SPO);
-	if(s->mode_bit & SPI_CPHA)
-		cr0 |= SSP_CR0_SPH;
-	if(s->mode_bit & SPI_CPOL)
-		cr0 |= SSP_CR0_SPO;
-	cr0 |= SSP_CR0_EXSPI_FRAME;
+	writew(cpsr, s->base + SSP_CPSR);
+	/* full rewrite from scratch in mode 0: this is only the probe/resume
+	 * initial state, every real transfer path reconfigures CR0
+	 * completely for the addressed device */
+	cr0 = SSP_CR0_EXSPI_FRAME | SSP_CR0_BIT_MODE(8);
+	cr0 |= scr << SSP_SCR_SHFT;
 	writew(cr0, s->base + SSP_CR0);
 	/*clear and enable interrupt*/
 	//writew(0x0, s->base + SSP_RIS);
@@ -394,7 +467,9 @@ static int sf_exspi_default_setup(struct sf_exspi *s) {
 	       FIELD_PREP(SSP_FIFO_LEVEL_TX, DFLT_THRESH_TX),
 	       s->base + SSP_FIFO_LEVEL);
 
-	return 0;
+	s->cur_freq = s->freq;
+	s->cur_cpsr = cpsr;
+	s->cur_scr = scr;
 }
 
 static const char *sf_exspi_get_name(struct spi_mem *mem) {
@@ -415,6 +490,72 @@ static const char *sf_exspi_get_name(struct spi_mem *mem) {
 	}
 
 	return name;
+}
+
+static int sf_exspi_transfer_one(struct spi_controller *ctlr,
+								 struct spi_device *spi,
+								 struct spi_transfer *xfer) {
+	struct sf_exspi *s = spi_controller_get_devdata(ctlr);
+	const u8 *tx = xfer->tx_buf;
+	u8 *rx = xfer->rx_buf;
+	unsigned int nbytes = xfer->len;
+	unsigned int bits;
+	u32 speed;
+	u16 cpsr, scr, cr0;
+	int ret = 0;
+
+	mutex_lock(&s->lock);
+
+	sf_exspi_disable(s);
+	sf_exspi_flush_rxfifo(s);
+
+	bits = xfer->bits_per_word ? : spi->bits_per_word;
+	if (bits != 8) {
+		dev_err(&spi->dev, "only 8-bit words are supported\n");
+		ret = -EINVAL;
+		goto out;
+	}
+
+	/* Motorola frame mode for plain full-duplex transfers; CS around
+	 * the message is owned by the core, frequency is per transfer */
+	speed = xfer->speed_hz ? : spi->max_speed_hz;
+	sf_exspi_set_speed(s, speed, &cpsr, &scr);
+	/* single complete CR0 write: Motorola frame (FRF=00), 8-bit words,
+	 * SPO/SPH from the device mode, SCR from set_speed */
+	cr0 = SSP_CR0_BIT_MODE(8) | (scr << SSP_SCR_SHFT);
+	if (spi->mode & SPI_CPOL)
+		cr0 |= SSP_CR0_SPO;
+	if (spi->mode & SPI_CPHA)
+		cr0 |= SSP_CR0_SPH;
+	writew(cr0, s->base + SSP_CR0);
+
+	sf_exspi_enable(s);
+	while (nbytes--) {
+		u8 byte = tx ? *tx++ : 0;
+
+		ret = sf_exspi_wait_txfifo_not_full(s);
+		if (ret)
+			goto out;
+
+		writew(byte, s->base + SSP_DR);
+
+		ret = sf_exspi_wait_rx_not_empty(s);
+		if (ret)
+			goto out;
+
+		/* always drain the RX FIFO, dropping data when the transfer
+		 * has no rx buffer, so the FIFO never overruns */
+		if (rx)
+			*rx++ = readw(s->base + SSP_DR);
+		else
+			readw(s->base + SSP_DR);
+	}
+
+	ret = sf_exspi_wait_not_busy(s);
+out:
+	sf_exspi_disable(s);
+	mutex_unlock(&s->lock);
+	return ret;
 }
 
 static const struct spi_controller_mem_ops sf_exspi_mem_ops = {
@@ -444,11 +585,12 @@ static int sf_exspi_probe(struct platform_device *pdev) {
 	master = devm_spi_alloc_master(&pdev->dev, sizeof(*s));
 	if (!master)
 		return -ENOMEM;
-	master->mode_bits = SPI_RX_DUAL | SPI_RX_QUAD |
-					  SPI_TX_DUAL | SPI_TX_QUAD;
+	master->mode_bits = SPI_CPOL | SPI_CPHA |
+			   SPI_RX_DUAL | SPI_RX_QUAD |
+			   SPI_TX_DUAL | SPI_TX_QUAD;
+	master->bits_per_word_mask = SPI_BPW_MASK(8);
 	s = spi_controller_get_devdata(master);
 	s->dev = dev;
-	s->mode_bit = 0;
 	platform_set_drvdata(pdev, s);
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	s->base = devm_ioremap_resource(dev, res);
@@ -497,6 +639,7 @@ static int sf_exspi_probe(struct platform_device *pdev) {
 	else
 		master->num_chipselect = num_cs;
 	master->mem_ops = &sf_exspi_mem_ops;
+	master->transfer_one = sf_exspi_transfer_one;
 	sf_exspi_default_setup(s);
 	master->dev.of_node = np;
 	ret = sf_exspi_csgpio_mode_set(dev, s);
