@@ -1,0 +1,60 @@
+#ifndef __CTC21101_H
+#define __CTC21101_H
+
+
+#define CTC21101_PHY_ID       0x00782013
+#define REG_PHY_SPEC_STATUS   0x11
+#define REG_DEBUG_ADDR_OFFSET 0x1e
+#define REG_DEBUG_DATA        0x1f
+
+#define CTC_PHY_MODE_FIBER    1
+#define CTC_PHY_MODE_UTP      2
+#define CTC_PHY_MODE_POLL     (CTC_PHY_MODE_FIBER | CTC_PHY_MODE_UTP)
+
+#define CTC21101_FLPA_PAUSE			(0x3 << 7)
+#define CTC21101_FLPA_ASYM_PAUSE	(0x2 << 7)
+
+#define CTC_SPEED_MODE        0xc000
+#define CTC_DUPLEX            0x2000
+#define CTC_SPEED_MODE_BIT    14
+#define CTC_DUPLEX_BIT        13
+#define CTC_LINK_STATUS_BIT   10
+
+#define CTC21101_CLOCK_GATING_REG       0xC
+#define CTC21101_CGR_RX_CLK_EN          BIT(12)
+
+#define CTC21101_EXTREG_SLEEP_CONTROL1  0x27
+#define CTC21101_EN_SLEEP_SW_BIT        15
+
+#define CTC21101_LINK_TIMER_CFG2_REG    0xa5
+#define CTC21101_LTCR_EN_AUTOSEN        BIT(15)
+
+#define CTC21101_REG_SPACE_SELECT_REG	0xa000
+#define CTC21101_RSSR_SPACE_MASK		BIT(1)
+#define CTC21101_RSSR_FIBER_SPACE		(0x1 << 1)
+#define CTC21101_RSSR_UTP_SPACE			(0x0 << 1)
+#define CTC21101_RSSR_TO_BE_ARBITRATED	(0xFF)
+
+#define CTC21101_CHIP_CONFIG_REG        0xa001
+#define CTC21101_CCR_SW_RST             BIT(15)
+#define CTC21101_CCR_RXC_DLY_EN         BIT(8)
+
+#define CTC21101_RGMII_CONFIG1          0xa003
+#define CTC21101_RC1R_GE_TX_DELAY_MASK  GENMASK(3,0)
+
+#define CTC21101_MISC_CONFIG_REG        0xa006
+#define CTC21101_MCR_FIBER_SPEED_MASK   BIT(0)
+#define CTC21101_MCR_FIBER_1000BX       (0x1 << 0)
+#define CTC21101_MCR_FIBER_100FX        (0x0 << 0)
+
+#define CTC21101_SYNCE_CFG_REG          0xa012
+#define CTC21101_SCR_SYNCE_ENABLE       BIT(5)
+
+struct ctc21101_priv {
+	__ETHTOOL_DECLARE_LINK_MODE_MASK(combo_advertising);
+	u8 polling_mode;
+	u8 chip_mode;
+	u8 reg_page;
+};
+
+#endif /* End of __CTC21101_H */

@@ -125,8 +125,21 @@
     status = "okay";
 };
 
-&reset {
-    gpio = <&gpio 1 GPIO_ACTIVE_HIGH>;
+&{/keys/reset} {
+    gpios = <&gpio 1 GPIO_ACTIVE_LOW>;
+};
+
+&usb_vbus {
+	/delete-property/ gpio;
+	/delete-property/ enable-active-high;
+};
+
+&iomux {
+    rstbtn_pin: rstbtn_pin {
+        pinctrl-single,pins = <CLK_OUT GPIO_MODE>;
+        pinctrl-single,bias-pullup = <SW_PU SW_PU 0 SW_PU>;
+        pinctrl-single,bias-pulldown = <0 SW_PD 0 SW_PD>;
+    };
 };
 
 &xgmac4 {
@@ -134,35 +147,50 @@
     nvmem-cells = <&mtd_mac_address>;
     nvmem-cell-names = "mac-address";
     mac-address-increment = <1>;
+    phy-mode = "1000base-x";
+	sfp-external-control;
+	pinctrl-names = "default";
+	pinctrl-0 = <&mac4_mdio_pins>;
     /delete-property/ phy-handle;
-    /delete-property/ pinctrl-names;
-    /delete-property/ pinctrl-0;
+
+    fixed-link {
+        speed = <1000>;
+        full-duplex;
+		pause;
+		asym-pause;
+    };
 };
 
 &mdio0 {
-    reset-gpios = <&gpio 30 GPIO_ACTIVE_LOW>;
-    reset-delay-us = <10000>;
-    reset-post-delay-us = <100000>;
+    /delete-property/ reset-gpios;
+    /delete-property/ reset-assert-us;
+    /delete-property/ reset-deassert-us;
+    /delete-node/ ethernet-phy@7;
 
     sfphy0: ethernet-phy@1 {
         compatible = "ethernet-phy-idadb4.0411";
         reg = <0x1>;
+		reset-gpios = <&gpio 39 GPIO_ACTIVE_LOW>;
+		reset-assert-us = <10000>;
+		reset-deassert-us = <100000>;
     };
+};
 
-    sfphy1: ethernet-phy@2 {
-        compatible = "ethernet-phy-idadb4.0411";
-        reg = <0x2>;
-    };
+&mdio1 {
+	ctcphy: ethernet-phy@0 {
+		compatible = "ethernet-phy-id0078.2013";
+		reg = <0x0>;
+	};
+};
 
-    sfphy2: ethernet-phy@3 {
-        compatible = "ethernet-phy-idadb4.0411";
-        reg = <0x3>;
-    };
-
-    sfphy3: ethernet-phy@4 {
-        compatible = "ethernet-phy-idadb4.0411";
-        reg = <0x4>;
-    };
+&xgmac5 {
+	status = "okay";
+	tx-internal-delay-ps = <2793>;
+	rx-internal-delay-ps = <1372>;
+	phy-handle = <&ctcphy>;
+	nvmem-cells = <&mtd_mac_address>;
+	nvmem-cell-names = "mac-address";
+	sfp-external-control;
 };
 
 #include "sf21h8898-factory.dtsi"
